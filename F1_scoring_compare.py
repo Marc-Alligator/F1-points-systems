@@ -29,7 +29,8 @@ TEST_RACE_SCORING = None
 TEST_SPRINT_SCORING = None
 TEST_POINTS_FOR_FASTEST_LAP = None
 
-USE_538_CHAMPION_SCORING = True
+USE_538_ASSUMPTIONS = False
+
 
 year_range = None
 year_range = (2013, 2013)
@@ -78,6 +79,20 @@ ALL_RACES = ALL_RACES.where(ALL_RACES['year'] >= first_year).where(ALL_RACES['ye
 ALL_RACES['has sprint'] = ALL_RACES['sprint_date'].fillna(r'\N') != r'\N'
 ALL_RACES['sprints so far'] = ALL_RACES.groupby('year')['has sprint'].cumsum()
 
+def get_mean_positions(results):
+    results['finished'] = results['position'] != r'\N'
+    results['position'] = results['position'].where(results['position'].str.isnumeric())
+    results = results.astype({'position':'float'})
+    results = results.merge(ALL_RACES[['raceId','year']])
+    results[ 'sum of positions' ]=results.groupby(['year','driverId'])['position'].cumsum()
+    results['finishes in season']=results.groupby(['year','driverId'])['finished'].cumsum()
+    results['mean position'] = results[ 'sum of positions' ] / results['finishes in season']
+    return results
+
+print("Calculating average finish positions...")
+ALL_RACE_RESULTS   = get_mean_positions(ALL_RACE_RESULTS)
+ALL_SPRINT_RESULTS = get_mean_positions(ALL_SPRINT_RESULTS)
+
 print("Calculating fastest laps...")
 ALL_RACE_RESULTS['fast lap rank'] = ALL_RACE_RESULTS.groupby('raceId')['fastestLapTime'].rank()
 
@@ -86,7 +101,7 @@ columns_to_drop = [column for column in ALL_RACES.columns if 'date' in column or
 columns_to_drop.extend(['circuitId','url'])
 ALL_RACES.drop(columns_to_drop, axis = 1)
 
-RESULTS_COLUMNS = ['resultId','raceId','driverId','position']
+RESULTS_COLUMNS = ['resultId','raceId','driverId','position', 'mean position']
 ALL_RACE_RESULTS = ALL_RACE_RESULTS[RESULTS_COLUMNS+['fast lap rank']]
 ALL_SPRINT_RESULTS = ALL_SPRINT_RESULTS[RESULTS_COLUMNS]
 
@@ -94,23 +109,30 @@ def get_points(pos, scoring_system):
     if type(pos) == pd.Series:
         pos = pos['position']
     if type(pos) == str:
-        if pos == r'\N': return 0
+        if pos == r'\N': return 0.0
         else: pos = float(pos)
-    if type(pos) == float:
+    # assume float or int
+    if type(pos) != int:
         if pos.is_integer():
             pos = int(pos)
-        else: # use power notation to get a non-linear intermediate value
-            better_pos = floor(pos)
-            better_points = get_points(better_pos,scoring_system)
-            if better_points <= 0:
-                return 0
-            partial_pos = pos - better_pos
-            worse_pos = better_pos + 1
-            worse_points = get_points(worse_pos,scoring_system)
-            return better_points*pow(worse_points/better_points,partial_pos)
     if type(pos) == int:
-        if pos > len(scoring_system): return 0
-        else: return scoring_system[pos-1]
+        if pos > len(scoring_system): return 0.0
+        else: return float(scoring_system[pos-1])
+    # assume float
+    if pd.isna(pos):
+        return 0.0
+    if pos.is_integer():
+        pos = int(pos)
+    else: # use power notation to get a non-linear intermediate value
+        better_pos = floor(pos)
+        better_points = get_points(better_pos,scoring_system)
+        if better_points <= 0:
+            return 0.0
+        partial_pos = pos - better_pos
+        worse_pos = better_pos + 1
+        worse_points = get_points(worse_pos,scoring_system)
+        return better_points*pow(worse_points/better_points,partial_pos)
+
     
 
 def year_scoring_system(year):
@@ -151,6 +173,7 @@ def build_race_points_columns(race_results, scoring_system):
     race_results['fast lap points'] = (race_results['fast lap rank'] == 1
                                             ) * (race_results['race points'] > 0
                                                  ) * points_for_fastest_lap
+    race_results = race_results.astype({'race points':float})
     return race_results
 
 def build_sprint_points_column(sprint_results, scoring_system, cum_points = True):
@@ -161,7 +184,7 @@ def build_sprint_points_column(sprint_results, scoring_system, cum_points = True
         sprint_results['sprint points'] = pd.Series(dtype = int)
     return sprint_results
 
-if not USE_538_CHAMPION_SCORING:
+if not USE_538_ASSUMPTIONS:
     print("""Calculating mean points that would have been scored by historical champions 
      under different points systems""")
     LAST_RACES = ALL_RACES.sort_values('raceId',ascending = False).groupby('year').nth(0)
@@ -206,18 +229,26 @@ def get_season_status(row, num_races, num_sprints, scoring_system):
     round_no= row['round']
     sprint_no = row['sprints so far']
     points1, points2 = row['cum points #1'], row['cum points #2']
+    mean_pos1 = row['mean position (race) #1']
     
     races_remaining = num_races - round_no
     sprints_remaining = num_sprints - sprint_no
     
     '''different cases in order from most optimistic to least optimistic'''
-    '''Possible if #2 scores like champ and #1 scores normally?'''
+    
+    
+    '''What if #2 scores like champ 
+    and #1 scores normally?'''
     
     race_scoring, sprint_scoring, points_for_fastest_lap = scoring_system
-    champion_mean_points = get_points(3.6, race_scoring) if USE_538_CHAMPION_SCORING else CHAMPION_MEAN_POINTS[year]
-    
-    driver1_mean_points = points1 / num_races
-    
+    if USE_538_ASSUMPTIONS:
+        champion_mean_points = get_points(3.6, race_scoring)
+        driver1_mean_pos = mean_pos1
+        driver1_mean_points = get_points(driver1_mean_pos, race_scoring)
+    else:
+        champion_mean_points = CHAMPION_MEAN_POINTS[year]
+        driver1_mean_points = points1 / round_no
+
     final_score1 = sum([points1,
                         races_remaining * driver1_mean_points
                         ])
@@ -230,8 +261,8 @@ def get_season_status(row, num_races, num_sprints, scoring_system):
     if final_score2 == final_score1:
         return "tie possible if #2 scores like champ and #1 scores normally"
     
-    '''Possible if #2 scores perfectly and #1 scores normally?'''
-    
+    '''What if #2 scores perfectly 
+    and #1 scores normally?'''
     final_score2 = sum([points2,
                        races_remaining  *get_points(1,race_scoring),
                        races_remaining  *points_for_fastest_lap,
@@ -241,7 +272,8 @@ def get_season_status(row, num_races, num_sprints, scoring_system):
     if final_score2 == final_score1:
         return "tie possible if #2 scores perfectly and #2 scores normally"
     
-    '''Possible if #2 drives perfectly, #1 scores 0 points'''
+    '''What if #2 drives perfectly 
+    and #1 scores 0 points'''
     final_score1 = points1
     if final_score2 > final_score1:
         return "comeback possible if #2 scores perfectly and #1 scores 0 points"
@@ -259,7 +291,7 @@ def get_season_statuses(year):
     year_race_results = ALL_RACE_RESULTS.merge(year_race_ids)
     year_sprint_results = ALL_SPRINT_RESULTS.merge(year_race_ids)
     # Points
-    year_race_results   =   build_race_points_columns(year_race_results, scoring_system)
+    year_race_results   =   build_race_points_columns(year_race_results,   scoring_system)
     year_sprint_results = build_sprint_points_column (year_sprint_results, scoring_system)
     # Race and Sprint
     year_results = pd.merge(year_race_results,year_sprint_results,how = 'left', 
@@ -274,7 +306,8 @@ def get_season_statuses(year):
     year_results['cum points'] = sum([year_results['cum race points'],
                                       year_results['cum sprint points'],
                                       year_results['cum fast lap points']])
-    year_results = year_results[['raceId','driverId','round','cum points', 'sprints so far']]
+    year_results = year_results[['raceId','driverId','round','cum points', 'sprints so far',
+                                 'mean position (race)','mean position (sprint)']]
     no1s = year_results.sort_values('cum points',ascending = False).groupby('round', as_index=False).nth(0)
     no2s = year_results.sort_values('cum points',ascending = False).groupby('round', as_index=False).nth(1)
     rounds = pd.merge(no1s,no2s, on = ['raceId','round','sprints so far'], suffixes = (' #1',' #2'))
@@ -309,5 +342,5 @@ avg_first_races = first_races[['status','first race']].groupby(['status'], as_in
 print("\n"+"Average First Races:")
 print(avg_first_races)
 
-Round14 = statuses.where(statuses['round'] == 14).dropna()
+Round14 = statuses.where(statuses['round'] == 14).dropna(how = 'all')
 races_per_year = ALL_RACES.groupby('year').count()['raceId']
